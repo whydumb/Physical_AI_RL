@@ -1,319 +1,207 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
 import com.kAIS.KAIMyEntity.urdf.URDFJoint;
-import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
+import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.AbstractSliderButton;
 import net.minecraft.client.gui.components.Button;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
-import org.joml.Vector3f;
 
-import java.lang.reflect.Method;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * MotionEditorScreen (경량, 리플렉션 버전)
- * - 좌: URDF 조인트 리스트 (현재값/리밋)
- * - 우: 선택 조인트 슬라이더 (setJointPreview 호출)
- * - 상단: [Refresh] [Zero] [Close]
+ * URDF Joint Editor (즉시 적용 전용)
+ * - 키프레임/재생 제거
+ * - 페이지 분할(Prev/Next)
+ * - 각 관절 행: [-] 슬라이더 [+]  (리미트 기반 스케일)
+ * - 상단: Prev / Next / Page, Reset All
+ * - 하단: Exit
  *
- * renderer: getRobotModel(), setJointPreview(String,float) 를 가진 객체여야 함.
- * (리플렉션으로 호출하므로 타입 캐스팅 없이 동작)
+ * 요구:
+ * - URDFModelOpenGLWithSTL에 getRobotModel(), setJointPreview(name,rad), setJointTarget(name,rad)
+ * - ClientTickLoop에서 renderer.tickUpdate(1/20f)
  */
 public class MotionEditorScreen extends Screen {
-
-    // 색상
-    private static final int BG = 0xFF0E0E10;
-    private static final int PANEL = 0xFF1D1F24;
-    private static final int TITLE = 0xFFFFD770;
-    private static final int TEXT  = 0xFFE6E6E6;
-    private static final int SUB   = 0xFF98B6FF;
-    private static final int OK    = 0xFF90EE90;
-    private static final int WARN  = 0xFFFFB070;
-
-    private final Screen parent;
-    private final Object renderer; // 리플렉션 대상
-
-    // 레이아웃
-    private int margin = 8;
-    private int listTop;
-    private int listHeight;
-    private int colWidth;
-    private int leftX, rightX;
-
-    // 데이터
+    private final URDFModelOpenGLWithSTL renderer;
     private final List<Row> rows = new ArrayList<>();
-    private String selectedJoint = null;
-    private String status = "";
 
-    // 페이지
-    private int perPage = 20;
     private int page = 0;
+    private final int perPage = 14; // 페이지당 관절 수
 
-    // 버튼/컨트롤
-    private Button refreshBtn, zeroBtn, closeBtn;
-    private FloatSlider slider;
-
-    private int tickCtr = 0;
-    private boolean mouseDownCache = false;
-
-    public MotionEditorScreen(Screen parent, Object renderer) {
-        super(Component.literal("URDF Motion Editor"));
-        this.parent = parent;
+    public MotionEditorScreen(URDFModelOpenGLWithSTL renderer) {
+        super(Component.literal("URDF Joint Editor"));
         this.renderer = renderer;
     }
 
     @Override
     protected void init() {
-        super.init();
-        layout();
-        buildButtons();
-        rebuildRows();
-        ensureSelection();
-        buildSliderForSelection(); // 선택되었으면 슬라이더 구성
+        rebuild();
     }
 
-    private void layout() {
-        listTop = margin + 24;
-        listHeight = this.height - listTop - 60;
-        colWidth = (this.width - margin * 3) / 2;
-        leftX = margin;
-        rightX = leftX + colWidth + margin;
-        perPage = Math.max(8, listHeight / 14);
-    }
-
-    private void buildButtons() {
-        int y = margin;
-
-        refreshBtn = addRenderableWidget(Button.builder(Component.literal("Refresh"), b -> {
-            rebuildRows();
-            buildSliderForSelection();
-        }).bounds(leftX, y, 80, 20).build());
-
-        zeroBtn = addRenderableWidget(Button.builder(Component.literal("Zero"), b -> {
-            if (selectedJoint == null) { status = "먼저 조인트를 선택하세요."; return; }
-            sendPreview(selectedJoint, 0f);
-            rebuildRows();
-            buildSliderForSelection();
-        }).bounds(leftX + 86, y, 60, 20).build());
-
-        closeBtn = addRenderableWidget(Button.builder(Component.literal("Close"), b -> onClose())
-                .bounds(this.width - margin - 70, y, 70, 20).build());
-    }
-
-    private void ensureSelection() {
-        if (selectedJoint != null) return;
-        if (!rows.isEmpty()) selectedJoint = rows.get(0).name;
-    }
-
-    private void rebuildRows() {
+    private void rebuild() {
+        clearWidgets();
         rows.clear();
-        URDFRobotModel model = reflectGetRobotModel(renderer);
-        if (model == null || model.joints == null || model.joints.isEmpty()) {
-            rows.add(new Row("(no URDF model)", 0f, Float.NaN, Float.NaN, false));
-            return;
+
+        int headerY = 10;
+        int listTop  = 42;
+        int leftX    = 20;
+
+        // ===== 페이지 컨트롤 =====
+        addRenderableWidget(Button.builder(Component.literal("< Prev"), b -> {
+            if (page > 0) { page--; rebuild(); }
+        }).bounds(leftX, headerY, 60, 20).build());
+
+        int total  = renderer.getRobotModel().joints.size();
+        int pages  = Math.max(1, (int)Math.ceil(total / (double)perPage));
+
+        addRenderableWidget(Button.builder(Component.literal("Next >"), b -> {
+            if (page < pages - 1) { page++; rebuild(); }
+        }).bounds(leftX + 66, headerY, 60, 20).build());
+
+        Button pageLabel = Button.builder(Component.literal("Page " + (page+1) + "/" + pages), b -> {})
+                .bounds(leftX + 132, headerY, 90, 20).build();
+        pageLabel.active = false;
+        addRenderableWidget(pageLabel);
+
+        // ===== Reset All =====
+        addRenderableWidget(Button.builder(Component.literal("Reset All"), b -> {
+            for (URDFJoint j : renderer.getRobotModel().joints) {
+                renderer.setJointPreview(j.name, 0f); // 즉시
+                renderer.setJointTarget(j.name, 0f);  // 안정 추종
+            }
+            for (Row r : rows) r.slider.setFromRadians(0f);
+        }).bounds(width - 100, headerY, 80, 20).build());
+
+        // ===== 관절 리스트 (현재 페이지) =====
+        int start = page * perPage;
+        int end   = Math.min(total, start + perPage);
+
+        int y = listTop;
+        List<URDFJoint> joints = renderer.getRobotModel().joints;
+
+        for (int i = start; i < end; i++) {
+            URDFJoint j = joints.get(i);
+
+            // 리미트 (없으면 -180~180도)
+            float lo = (j.limit != null && j.limit.hasLimits()) ? j.limit.lower : (float)Math.toRadians(-180);
+            float hi = (j.limit != null && j.limit.hasLimits()) ? j.limit.upper : (float)Math.toRadians( 180);
+            if (hi <= lo) { lo = (float)Math.toRadians(-180); hi = (float)Math.toRadians(180); }
+
+            // 🔧 람다용 final 복사본 (중요!)
+            final URDFJoint jRef = j;
+            final float loF = lo, hiF = hi;
+
+            // [-] 조그
+            addRenderableWidget(Button.builder(Component.literal("-"), b -> {
+                float step = (float)Math.toRadians(2.0);
+                float v = clamp(jRef.currentPosition - step, loF, hiF);
+                renderer.setJointPreview(jRef.name, v);
+                renderer.setJointTarget(jRef.name, v);
+                syncRow(jRef.name, v);
+            }).bounds(leftX, y, 20, 20).build());
+
+            // 슬라이더 (0..1 -> lo..hi)
+            JointSlider slider = new JointSlider(leftX + 24, y, 260, 20,
+                    jRef.name, jRef.currentPosition, loF, hiF, renderer);
+            rows.add(new Row(jRef.name, slider));
+            addRenderableWidget(slider);
+
+            // [+] 조그
+            addRenderableWidget(Button.builder(Component.literal("+"), b -> {
+                float step = (float)Math.toRadians(2.0);
+                float v = clamp(jRef.currentPosition + step, loF, hiF);
+                renderer.setJointPreview(jRef.name, v);
+                renderer.setJointTarget(jRef.name, v);
+                syncRow(jRef.name, v);
+            }).bounds(leftX + 288, y, 20, 20).build());
+
+            y += 24;
         }
-        for (URDFJoint j : model.joints) {
-            String name = (j.name != null) ? j.name : "(unnamed)";
-            float cur = j.currentPosition;
-            boolean hasLim = (j.limit != null && j.limit.upper > j.limit.lower);
-            float lo = hasLim ? (float) j.limit.lower : Float.NaN;
-            float hi = hasLim ? (float) j.limit.upper : Float.NaN;
-            rows.add(new Row(name, cur, lo, hi, j.isMovable()));
-        }
-        rows.sort(Comparator.comparing(r -> r.name.toLowerCase(Locale.ROOT)));
-        page = 0;
+
+        // Exit
+        addRenderableWidget(Button.builder(Component.literal("Exit"), b -> {
+            Minecraft.getInstance().setScreen(null);
+        }).bounds(width - 70, height - 30, 50, 20).build());
     }
 
-    private void buildSliderForSelection() {
-        if (slider != null) { removeWidget(slider); slider = null; }
-        if (selectedJoint == null) return;
-
-        Row r = findRow(selectedJoint);
-        float min = - (float)Math.PI, max = (float)Math.PI; // 기본 회전 범위
-        if (r != null && r.hasLimit()) { min = r.lo; max = r.hi; }
-
-        float initial = (r != null) ? r.cur : 0f;
-        float fmin = (min == max ? - (float)Math.PI : min);
-        float fmax = (min == max ? (float)Math.PI  : max);
-        if (Float.isNaN(fmin) || Float.isNaN(fmax)) { fmin = - (float)Math.PI; fmax = (float)Math.PI; }
-
-        // 우측 상단에 슬라이더
-        slider = new FloatSlider(rightX, margin + 24, colWidth, 20,
-                Component.literal("Preview [rad]"),
-                fmin, fmax, initial, v -> {
-                    if (selectedJoint != null) sendPreview(selectedJoint, v);
-                });
-        addRenderableWidget(slider);
-    }
-
-    private Row findRow(String name) {
-        for (Row r : rows) if (Objects.equals(r.name, name)) return r;
-        return null;
-    }
-
-    private void sendPreview(String name, float value) {
-        try {
-            Method m = renderer.getClass().getMethod("setJointPreview", String.class, float.class);
-            m.invoke(renderer, name, value);
-            status = "Preview: " + name + " = " + String.format(Locale.ROOT, "%.3f", value);
-        } catch (Throwable t) {
-            status = "setJointPreview 호출 실패: " + t.getMessage();
-        }
-    }
-
-    @Override
-    public void tick() {
-        super.tick();
-        if (++tickCtr >= 20) { // 약 1초마다
-            tickCtr = 0;
-            rebuildRows();
-            // 슬라이더 현재값을 갱신 (조인트가 외부에서 바뀌었을 수도)
-            if (selectedJoint != null && slider != null) {
-                Row r = findRow(selectedJoint);
-                if (r != null) slider.setValueImmediately(r.cur);
+    private void syncRow(String jointName, float radians) {
+        for (Row r : rows) {
+            if (r.jointName.equals(jointName)) {
+                r.slider.setFromRadians(radians);
+                break;
             }
         }
-    }
-
-    @Override
-    public void resize(Minecraft mc, int w, int h) {
-        super.resize(mc, w, h);
-        layout();
-        buildButtons();
-        rebuildRows();
-        buildSliderForSelection();
-    }
-
-    @Override
-    public boolean keyPressed(int keyCode, int scanCode, int modifiers) {
-        // F5 새로고침
-        if (keyCode == 294) {
-            rebuildRows();
-            buildSliderForSelection();
-            return true;
-        }
-        return super.keyPressed(keyCode, scanCode, modifiers);
     }
 
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
-        // 배경
-        g.fill(0, 0, this.width, this.height, BG);
-
-        // 좌/우 패널
-        g.fill(leftX,  listTop, leftX  + colWidth, listTop + listHeight, PANEL);
-        g.fill(rightX, listTop, rightX + colWidth, listTop + listHeight, PANEL);
-
-        // 기본 위젯
+        renderBackground(g, mouseX, mouseY, partialTicks);
         super.render(g, mouseX, mouseY, partialTicks);
-
-        // 상단 타이틀
-        g.drawString(this.font, "URDF Joints", leftX, margin + 4, TITLE, false);
-        g.drawString(this.font, "Selected Joint Preview", rightX, margin + 4, TITLE, false);
-
-        // 리스트(좌측)
-        int y = listTop + 4;
-        int start = page * perPage;
-        int end = Math.min(rows.size(), start + perPage);
-        for (int i = start; i < end; i++) {
-            Row r = rows.get(i);
-            int lineColor = Objects.equals(selectedJoint, r.name) ? OK : TEXT;
-
-            // 이름
-            g.drawString(this.font, r.name, leftX + 6, y, lineColor, false);
-
-            // 세부 (현재/리밋)
-            String detail = r.hasLimit()
-                    ? String.format(Locale.ROOT, "cur=%.3f  lim=[%.3f, %.3f]", r.cur, r.lo, r.hi)
-                    : String.format(Locale.ROOT, "cur=%.3f", r.cur);
-            g.drawString(this.font, detail, leftX + 6 + this.font.width(r.name) + 6, y, SUB, false);
-
-            // 클릭 선택(간단 히트박스)
-            if (mouseY >= y && mouseY < y + 12 &&
-                mouseX >= leftX && mouseX < leftX + colWidth && clickOnce()) {
-                selectedJoint = r.name;
-                buildSliderForSelection();
-                status = "선택: " + r.name;
-            }
-            y += 14;
-        }
-
-        // 페이지 인디케이터
-        String pg = String.format(Locale.ROOT, "Page %d/%d", (rows.isEmpty()?0:page+1),
-                Math.max(1, (int)Math.ceil(rows.size() / (double)perPage)));
-        g.drawString(this.font, pg, leftX + colWidth - this.font.width(pg) - 6,
-                listTop + listHeight - 12, SUB, false);
-
-        // 상태 메시지
-        if (!status.isEmpty()) {
-            g.drawString(this.font, status, margin, this.height - 28, WARN, false);
-        }
+        g.drawCenteredString(font, "URDF Joint Editor (Immediate)", width / 2, 2, 0xFFFFFF);
     }
 
-    private boolean clickOnce() {
-        boolean now = Minecraft.getInstance().mouseHandler.isLeftPressed();
-        boolean ret = now && !mouseDownCache;
-        mouseDownCache = now;
-        return ret;
-    }
+    // ===== 내부 구조 =====
+    private record Row(String jointName, JointSlider slider) {}
 
-    @Override
-    public void onClose() {
-        this.minecraft.setScreen(this.parent);
-    }
+    private static class JointSlider extends AbstractSliderButton {
+        private final String jointName;
+        private final URDFModelOpenGLWithSTL renderer;
+        private final float lo, hi;
 
-    /* ===== 행 모델 ===== */
-    private static final class Row {
-        final String name;
-        final float cur;
-        final float lo, hi;
-        final boolean movable;
-        Row(String n, float c, float lo, float hi, boolean mv) {
-            this.name = n; this.cur = c; this.lo = lo; this.hi = hi; this.movable = mv;
-        }
-        boolean hasLimit() { return !Float.isNaN(lo) && !Float.isNaN(hi) && hi > lo; }
-    }
-
-    /* ===== 슬라이더 ===== */
-    private static final class FloatSlider extends AbstractSliderButton {
-        private final float min, max;
-        private final java.util.function.Consumer<Float> onChange;
-        private final String base;
-
-        FloatSlider(int x, int y, int w, int h, Component label,
-                    float min, float max, float initial, java.util.function.Consumer<Float> onChange) {
-            super(x, y, w, h, label, 0.0D);
-            this.min = min; this.max = max; this.onChange = onChange; this.base = label.getString();
-            setValueImmediately(initial);
-        }
-
-        void setValueImmediately(float v) {
-            this.value = toSlider(v);
-            applyValue();
+        /** current(rad)를 lo..hi 기준 0..1로 정규화하여 초기화 */
+        public JointSlider(int x, int y, int w, int h,
+                           String jointName, float currentRad, float lo, float hi,
+                           URDFModelOpenGLWithSTL renderer) {
+            super(x, y, w, h, Component.literal(""), normalize(currentRad, lo, hi));
+            this.jointName = jointName;
+            this.renderer = renderer;
+            this.lo = lo;
+            this.hi = hi;
             updateMessage();
         }
 
-        private double toSlider(float v) { return (v - min) / (double)(max - min); }
-        private float fromSlider(double s) { return (float)(min + s * (max - min)); }
-
         @Override
         protected void updateMessage() {
-            float v = fromSlider(this.value);
-            this.setMessage(Component.literal(base + ": " + String.format(Locale.ROOT, "%.3f", v)));
+            float rad = denorm((float) value);
+            int deg = Math.round((float)Math.toDegrees(rad));
+            setMessage(Component.literal(jointName + ": " + deg + "°"));
         }
+
         @Override
-        protected void applyValue() { onChange.accept(fromSlider(this.value)); }
+        protected void applyValue() {
+            float rad = denorm((float) value);
+            renderer.setJointPreview(jointName, rad); // 즉시 화면 반영
+            renderer.setJointTarget(jointName, rad);  // 틱에서 안정 추종
+        }
+
+        @Override
+        public boolean mouseDragged(double mx, double my, int button, double dx, double dy) {
+            boolean r = super.mouseDragged(mx, my, button, dx, dy);
+            float rad = denorm((float) value);
+            renderer.setJointPreview(jointName, rad); // 드래그 중 매 프레임
+            renderer.setJointTarget(jointName,  rad); // ★ 추가: 드래그 중에도 target 동기화
+            return r;
+        }
+
+        /** 외부에서 라디안으로 동기화(조그/리셋) */
+        public void setFromRadians(float rad) {
+            this.value = normalize(rad, lo, hi);
+            updateMessage();
+        }
+
+        private float denorm(float v01) { return lo + v01 * (hi - lo); }
+        private static float normalize(float v, float lo, float hi) {
+            if (hi - lo <= 1e-6f) return 0.5f;
+            float t = (v - lo) / (hi - lo);
+            return t < 0 ? 0 : Math.min(1, t);
+        }
     }
 
-    /* ===== 리플렉션 ===== */
-    private URDFRobotModel reflectGetRobotModel(Object rend) {
-        try {
-            Method m = rend.getClass().getMethod("getRobotModel");
-            return (URDFRobotModel) m.invoke(rend);
-        } catch (Throwable ignored) {}
-        return null;
+    // ===== 유틸 =====
+    private static float clamp(float v, float lo, float hi) {
+        return v < lo ? lo : Math.min(hi, v);
     }
 }
