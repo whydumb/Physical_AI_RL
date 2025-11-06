@@ -1,6 +1,5 @@
 package com.kAIS.KAIMyEntity.renderer;
 
-import com.kAIS.KAIMyEntity.KAIMyEntityClient;
 import com.kAIS.KAIMyEntity.vrm.VrmLoader;
 import com.kAIS.KAIMyEntity.vrm.VrmLoader.VrmSkeleton;
 
@@ -132,11 +131,52 @@ public class MMDModelManager {
             if (isPropertiesLoaded && !forceReload)
                 return;
             String path2Properties = gameDirectory + "/KAIMyEntity/" + modelName + "/model.properties";
-            try {
-                InputStream istream = new FileInputStream(path2Properties);
+            try (InputStream istream = new FileInputStream(path2Properties)) {
                 properties.load(istream);
             } catch (IOException e) {
                 // properties 없어도 OK
             }
             isPropertiesLoaded = true;
-            // KAIMyEntityClient.reloadP
+            // KAIMyEntityClient.reloadProperties = false;
+        }
+
+        public boolean isURDFModel() { return true; }
+    } // <-- Model 클래스 닫힘
+
+    /**
+     * URDF 모델
+     */
+    public static class URDFModelData extends Model {
+        // 기본 구현
+    }
+
+    // ========== VRM/GLB 탐색 유틸 ==========
+
+    private static File findAvatarFile(File modelDir) {
+        // 1) 우선순위 파일명
+        String[] prefer = { "avatar.vrm", "humanoid.vrm", "avatar.glb", "humanoid.glb" };
+        for (String p : prefer) {
+            File f = new File(modelDir, p);
+            if (f.exists()) return f;
+        }
+
+        // 2) 같은 폴더의 .vrm/.glb
+        File[] list = modelDir.listFiles((dir, name) -> {
+            String s = name.toLowerCase(Locale.ROOT);
+            return s.endsWith(".vrm") || s.endsWith(".glb");
+        });
+        if (list != null && list.length > 0) return list[0];
+
+        // 3) meshes/ 폴더 내 .vrm/.glb
+        File meshes = new File(modelDir, "meshes");
+        if (meshes.isDirectory()) {
+            File[] m = meshes.listFiles((dir, name) -> {
+                String s = name.toLowerCase(Locale.ROOT);
+                return s.endsWith(".vrm") || s.endsWith(".glb");
+            });
+            if (m != null && m.length > 0) return m[0];
+        }
+
+        return null;
+    }
+}
