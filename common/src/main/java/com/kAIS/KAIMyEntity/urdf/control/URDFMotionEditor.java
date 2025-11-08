@@ -1,379 +1,314 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
-import com.kAIS.KAIMyEntity.urdf.URDFJoint;
-import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
+import com.kAIS.KAIMyEntity.urdf.URDFJoint;
+import com.kAIS.KAIMyEntity.urdf.URDFRobotModel;
+
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.gui.components.ObjectSelectionList;
 import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
+
 import org.joml.Quaternionf;
 import org.joml.Vector3f;
 
+import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+
 import java.util.*;
+import java.util.function.Supplier;
 
 /**
- * URDFMotionEditor (이름 유지) — VMC/URDF 인스펙터 + 반자동 매핑 위저드
+ * URDFMotionEditor (이름 유지) — VMC 본 → URDF 조인트 매핑 + 인터랙티브 캘리브레이션 GUI
  *
- * 추가된 것:
- * - 매핑 스키마(VMCURDFMapping) + JSON 저장/불러오기
- * - 본 하나 선택 후, 사용자가 "URDF 관절을 한 축으로만 왕복" → 회귀해서 multiplier/offset/축/성분 추정
- * - 버튼: [위저드 시작] [기록/정지] [이 단계 적용] [저장] [불러오기]
+ * - 좌: 실시간 VMC 본 목록(HumanoidTag 이름) 선택
+ * - 우: URDF 조인트 목록(현재각/리밋) 선택 + 슬라이더로 수동구동
+ * - 중앙: 선택 상태 표시 + "Record / Stop+Fit / Add/Update Mapping" + 매핑 리스트 + Save/Load + Live Preview
+ * - 실시간으로 본 회전(Quaternion) → 조인트축 투영 각도(2*atan2(v·a, w))을 샘플링하여 회귀로 multiplier/offset 산출
+ * - Live Preview: VmcMarionetteManager.getState()를 주기적으로 읽어 setJointPreview() 적용
  *
- * 시각:
- * - 좌/우 패널 불투명 배경, 텍스트 오버레이 (간단 프리뷰)
+ * ⚙️ 의존성:
+ *  - 이 스크린은 renderer(Object)에 대해 다음 시그니처를 리플렉션 수행합니다.
+ *      URDFRobotModel getRobotModel()
+ *      void setJointPreview(String,float)
+ *      String getModelDir() 또는 GetModelDir()
+ *
+ *  - VMC 상태는 Class.forName("top.fifthlight.armorstand.vmc.VmcMarionetteManager").getMethod("getState") 로 취득합니다.
+ *
+ * 📝 저장 포맷: { "mappings":[ { vmcBone, urdfJoint, multiplier, offset, component, mode, axis:{x,y,z} } ... ] }
  */
 public class URDFMotionEditor extends Screen {
 
-    // ---------- 색상(불투명) ----------
-    private static final int BG_COLOR    = 0xFF0E0E10; // 화면 전체 배경
-    private static final int PANEL_COLOR = 0xFF1D1F24; // 좌/우 패널 박스
-    private static final int TITLE_LEFT_COLOR  = 0xFFFFD770;
-    private static final int TITLE_RIGHT_COLOR = 0xFFFFD770;
-    private static final int TEXT_LEFT_COLOR   = 0xFFFFFFFF;
-    private static final int TEXT_LEFT_SUB     = 0xFFA0E0FF;
-    private static final int TEXT_RIGHT_COLOR  = 0xFFFFFFFF;
-    private static final int TEXT_RIGHT_SUB    = 0xFFB0FFA0;
+    // ------------ VMC 본 목록용 라벨 색/스타일 ------------
+    private static final int COLOR_BG      = 0xF016161A; // 전체 배경
+    private static final int COLOR_PANEL   = 0xE0202226; // 패널
+    private static final int COLOR_TITLE   = 0xFFE4B74A;
+    private static final int COLOR_TEXT    = 0xFFECECEC;
+    private static final int COLOR_SUB     = 0xFF9CC4F0;
+    private static final int COLOR_OK      = 0xFF3ECF8E;
+    private static final int COLOR_WARN    = 0xFFE97C20;
 
-    private final Screen parent;
-    private final Object renderer; // getRobotModel(), setJointPreview(), GetModelDir()
+    // ------------ VMC 표준 본 목록 (fallback용) ------------
+    private static final String[] FALLBACK_VRM_BONES = {
+            "Hips","Spine","Chest","UpperChest","Neck","Head",
+            "LeftShoulder","LeftUpperArm","LeftLowerArm","LeftHand",
+            "RightShoulder","RightUpperArm","RightLowerArm","RightHand",
+            "LeftUpperLeg","LeftLowerLeg","LeftFoot","LeftToes",
+            "RightUpperLeg","RightLowerLeg","RightFoot","RightToes"
+    };
 
-    // 좌/우 리스트 데이터
-    private final List<BoneRow> boneRows = new ArrayList<>();
-    private final List<JointRow> jointRows = new ArrayList<>();
+    // ------------ 매핑 데이터 구조 ------------
+    public static class VMCMapping {
+        public String vmcBone;
+        public String urdfJoint;
+        public float multiplier = 1.0f; // scale for theta_bone
+        public float offset = 0.0f;     // additive bias (rad)
+        public String component = "AXIS"; // "AXIS" | "Y" | "X" | "Z" | "pitch" | "yaw" | "roll"
+        public ExtractionMode mode = ExtractionMode.AXIS_PROJECTION;
+        public float ax = 0, ay = 1, az = 0; // used if mode==AXIS_PROJECTION
 
-    // 페이지 상태
-    private int bonePage = 0;
-    private int jointPage = 0;
-    private int perPageLeft = 18;
-    private int perPageRight = 18;
+        public enum ExtractionMode { EULER_X, EULER_Y, EULER_Z, QUATERNION_ANGLE, AXIS_PROJECTION }
 
-    // 레이아웃 캐시
-    private int margin = 8;
-    private int titleH = 16;
-    private int listTop;
-    private int colWidth;
-    private int leftX, rightX;
-    private int listHeight;
-
-    // UI 버튼 (상단 컨트롤 + 하단 위저드/저장)
-    private Button bonePrevBtn, boneNextBtn, bonePageBtn;
-    private Button jointPrevBtn, jointNextBtn, jointPageBtn;
-
-    private Button wizardStartBtn, recordToggleBtn, applyStepBtn, saveBtn, loadBtn;
-
-    // 선택 상태
-    private String selectedBone = null;
-    private String selectedJoint = null;
-
-    // 상태 메시지
-    private String status = "";
-
-    // ------- 매핑 스키마 -------
-    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
-    private VMCURDFMapping mapping = new VMCURDFMapping();
-
-    public static final class VMCURDFMapping {
-        public String robotName = "UNKNOWN";
-        public List<BoneMapping> mappings = new ArrayList<>();
-
-        public static final class BoneMapping {
-            public String vmcBone;
-            public List<JointComponent> joints = new ArrayList<>(); // ★ 순서 = 체인 순서
-            public float[] preRotCorr = {0,0,0,1};
-            public float   extraOffsetRad = 0f;
+        String label() {
+            String extra = switch (mode) {
+                case AXIS_PROJECTION -> String.format(Locale.ROOT, "axis(%.2f,%.2f,%.2f)", ax, ay, az);
+                case EULER_X -> "EULER_X";
+                case EULER_Y -> "EULER_Y";
+                case EULER_Z -> "EULER_Z";
+                case QUATERNION_ANGLE -> "ANGLE";
+            };
+            return String.format(Locale.ROOT, "%s → %s (×%.3f, +%.3f, %s)", vmcBone, urdfJoint, multiplier, offset, extra);
         }
-        public static final class JointComponent {
-            public String jointName;
-            public RotationComponent component = RotationComponent.PITCH;
-            public ExtractMode mode = ExtractMode.AUTO;   // EULER / AXIS_PROJ / MAGNITUDE
-            public float multiplier = 1f;
-            public float offset = 0f;
-            public float[] axis = null;                   // AXIS_PROJ 시 사용
-            public EulerOrder eulerOrder = EulerOrder.ZYX;
-        }
-        public enum RotationComponent { YAW, PITCH, ROLL, MAGNITUDE }
-        public enum ExtractMode { AUTO, EULER, AXIS_PROJ, MAGNITUDE }
-        public enum EulerOrder { ZYX, XYZ, XZY, YXZ, YZX, ZXY }
     }
+    private static class VMCMappingSet { public List<VMCMapping> mappings = new ArrayList<>(); }
 
-    // ------- 위저드(기록/회귀) -------
-    private MappingWizard wizard = null;
-    private boolean recording = false;
-    private int autoRefreshTicker = 0;
+    // ------------ 상태/의존성 ------------
+    private final Screen parent;
+    private final Object renderer; // expect getRobotModel(), setJointPreview(), get/GetModelDir()
+    private final Gson gson = new GsonBuilder().setPrettyPrinting().create();
+
+    private URDFRobotModel model; // filled in init from renderer.getRobotModel()
+    private Object vmcState;      // from VmcMarionetteManager.getState()
+
+    // UI lists
+    private BoneList  boneList;
+    private JointList jointList;
+    private MappingList mappingList;
+
+    // selections
+    private String     selectedBone;
+    private String     selectedJoint;
+    private URDFJoint  selectedJointObj;
+
+    // capture session
+    private boolean capturing = false;
+    private final List<Float> capBone = new ArrayList<>();
+    private final List<Float> capJoint = new ArrayList<>();
+    private long   captureStartMs = 0L;
+
+    // regression result (preview)
+    private float fitM = 1.0f;
+    private float fitC = 0.0f;
+    private VMCMapping.ExtractionMode curMode = VMCMapping.ExtractionMode.AXIS_PROJECTION;
+    private String curComponent = "AXIS";
+    private float ax = 0, ay = 1, az = 0; // axis for projection
+
+    // UI elements
+    private Button btnStartCap, btnStopFit, btnAddOrUpdate, btnRemove, btnSave, btnLoad, btnLive, btnClearCap;
+    private JointScrubSlider jointSlider;
+
+    private boolean livePreview = false;
+    private String  status = "";
 
     public URDFMotionEditor(Screen parent, Object renderer) {
-        super(Component.literal("VMC & URDF Mapper"));
+        super(Component.literal("VMC ↔ URDF Mapping"));
         this.parent = parent;
         this.renderer = renderer;
     }
 
-    // 하위호환: 예전 호출(new URDFMotionEditor(robotModel, ctrl))
-    public URDFMotionEditor(URDFRobotModel model, URDFSimpleController ctrl) {
-        this(Minecraft.getInstance() != null ? Minecraft.getInstance().screen : null,
-             new LegacyRendererAdapter(model));
-    }
-    private static final class LegacyRendererAdapter {
-        private final URDFRobotModel model;
-        LegacyRendererAdapter(URDFRobotModel model) { this.model = model; }
-        public URDFRobotModel getRobotModel() { return model; }
-        public String GetModelDir() { return "."; }
-        public void setJointPreview(String name, float v) { if (model==null||model.joints==null) return; for (URDFJoint j:model.joints) if (name.equals(j.name)) j.currentPosition=v; }
-    }
+    // ====================== lifecycle ======================
 
     @Override
     protected void init() {
         super.init();
-        computeLayout();
-        buildData();
-        buildHeaderControls();
-        buildWizardButtons();
-        updatePageLabels();
-    }
+        // fetch model via reflection once
+        this.model = reflectGetRobotModel();
 
-    private void computeLayout() {
-        listTop = margin + titleH + 4;
-        listHeight = Math.max(120, this.height - listTop - 60); // 아래에 버튼 영역 확보
-        colWidth = (this.width - margin * 3) / 2;
-        leftX = margin;
-        rightX = leftX + colWidth + margin;
+        final int pad = 8;
+        final int titleH = 16;
+        int top = pad + titleH + 6;
+        int listH = Math.max(120, this.height - top - 180);
+        int colW  = (this.width - 3*pad) / 2;
+        int leftX = pad;
+        int rightX = leftX + colW + pad;
 
-        perPageLeft = Math.max(5, listHeight / 12);
-        perPageRight = perPageLeft;
-    }
+        // --- left: VMC bones list ---
+        boneList = new BoneList(minecraft, colW, listH, top, leftX);
+        addWidget(boneList);
 
-    private void buildHeaderControls() {
-        // 좌측
-        bonePrevBtn = addRenderableWidget(Button.builder(Component.literal("< Prev"), b -> {
-            if (bonePage > 0) bonePage--;
-            updatePageLabels();
-        }).bounds(leftX, listTop - 26, 60, 20).build());
+        // --- right: URDF joints list ---
+        jointList = new JointList(minecraft, colW, listH, top, rightX);
+        addWidget(jointList);
 
-        boneNextBtn = addRenderableWidget(Button.builder(Component.literal("Next >"), b -> {
-            int pages = Math.max(1, (int)Math.ceil(boneRows.size() / (double)perPageLeft));
-            if (bonePage < pages - 1) bonePage++;
-            updatePageLabels();
-        }).bounds(leftX + 66, listTop - 26, 60, 20).build());
+        // fill lists
+        rebuildBoneList();
+        rebuildJointList();
 
-        bonePageBtn = addRenderableWidget(Button.builder(Component.literal("Page"), b -> {})
-                .bounds(leftX + 132, listTop - 26, 90, 20).build());
-        bonePageBtn.active = false;
+        // --- center controls (under lists) ---
+        int y = top + listH + 8;
 
-        // 우측
-        jointPrevBtn = addRenderableWidget(Button.builder(Component.literal("< Prev"), b -> {
-            if (jointPage > 0) jointPage--;
-            updatePageLabels();
-        }).bounds(rightX, listTop - 26, 60, 20).build());
+        // Capture buttons row
+        btnStartCap = addRenderableWidget(Button.builder(Component.literal("● Record"), b -> {
+            if (selectedBone == null || selectedJoint == null) { status = "본/조인트를 먼저 선택하세요."; return; }
+            capBone.clear(); capJoint.clear();
+            capturing = true;
+            captureStartMs = System.currentTimeMillis();
+            status = "캡처 시작… 선택한 조인트를 손으로 움직이세요";
+            // try to pick axis from joint
+            float[] axis = reflectGetJointAxis(selectedJointObj);
+            if (axis != null) { ax = axis[0]; ay = axis[1]; az = axis[2]; normAxis(); }
+        }).size(90, 20).pos(leftX, y).build());
 
-        jointNextBtn = addRenderableWidget(Button.builder(Component.literal("Next >"), b -> {
-            int pages = Math.max(1, (int)Math.ceil(jointRows.size() / (double)perPageRight));
-            if (jointPage < pages - 1) jointPage++;
-            updatePageLabels();
-        }).bounds(rightX + 66, listTop - 26, 60, 20).build());
+        btnStopFit = addRenderableWidget(Button.builder(Component.literal("■ Stop + Fit"), b -> {
+            if (!capturing) { status = "먼저 [Record] 하세요."; return; }
+            capturing = false;
+            if (capBone.size() < 5) { status = "샘플이 너무 적습니다."; return; }
+            // linear regression y ≈ m*x + c (joint angle vs projected bone angle)
+            float[] mc = fitLine(capBone, capJoint);
+            fitM = mc[0];  // multiplier
+            fitC = mc[1];  // offset
+            status = String.format(Locale.ROOT, "fit: θ_joint ≈ %.3f*θ_bone + %.3f", fitM, fitC);
+        }).size(120, 20).pos(leftX + 100, y).build());
 
-        jointPageBtn = addRenderableWidget(Button.builder(Component.literal("Page"), b -> {})
-                .bounds(rightX + 132, listTop - 26, 90, 20).build());
-        jointPageBtn.active = false;
-    }
+        btnClearCap = addRenderableWidget(Button.builder(Component.literal("Clear cap"), b -> {
+            capBone.clear(); capJoint.clear();
+            capturing = false;
+            status = "캡처 버퍼 초기화";
+        }).size(90, 20).pos(leftX + 230, y).build());
 
-    private void buildWizardButtons() {
-        int y = this.height - 28;
-
-        wizardStartBtn = addRenderableWidget(Button.builder(Component.literal("위저드 시작"), b -> {
-            if (selectedBone == null) { status = "본을 먼저 선택하세요."; return; }
-            wizard = new MappingWizard(selectedBone, this.renderer);
-            status = "위저드 시작: " + selectedBone;
-        }).bounds(this.width - 520, y, 100, 20).build());
-
-        recordToggleBtn = addRenderableWidget(Button.builder(Component.literal("기록/정지"), b -> {
-            if (wizard == null) { status = "위저드를 먼저 시작하세요."; return; }
-            if (selectedJoint == null) { status = "관절을 먼저 선택하세요."; return; }
-            if (!recording) {
-                wizard.beginJoint(selectedJoint);
-                recording = true;
-                status = "기록중… " + selectedJoint + " (해당 관절만 한 축으로 왕복)";
-            } else {
-                recording = false;
-                status = "기록 정지";
+        // joint manual driver
+        int sliderY = y + 30;
+        jointSlider = new JointScrubSlider(rightX, sliderY, colW, 20, 0f, 0f, val -> {
+            if (selectedJointObj != null) {
+                reflectSetJointPreview(selectedJointObj.name, val);
             }
-        }).bounds(this.width - 414, y, 100, 20).build());
+        });
+        addRenderableWidget(jointSlider);
 
-        applyStepBtn = addRenderableWidget(Button.builder(Component.literal("이 단계 적용"), b -> {
-            if (wizard == null) { status = "위저드를 먼저 시작하세요."; return; }
-            VMCURDFMapping.JointComponent jc = wizard.finalizeStep();
-            if (jc == null) { status = "유효한 상관 부족: 더 크게/한 축으로 천천히 움직이세요."; return; }
-            addJointComponentToMapping(selectedBone, jc);
-            status = "추가됨: " + selectedBone + " → " + jc.jointName
-                    + String.format(Locale.ROOT, " (m=%.3f, b=%.3f, %s)", jc.multiplier, jc.offset, jc.mode);
-        }).bounds(this.width - 308, y, 110, 20).build());
+        // mapping add/remove row
+        int mapCtlY = sliderY + 40;
+        btnAddOrUpdate = addRenderableWidget(
+                Button.builder(Component.literal("Add / Update Mapping"), b -> onAddOrUpdateMapping()).size(220, 20)
+                        .pos(leftX, mapCtlY).build()
+        );
+        btnRemove = addRenderableWidget(
+                Button.builder(Component.literal("삭제"), b -> onRemoveSelected()).size(70, 20)
+                        .pos(leftX + 230, mapCtlY).build()
+        );
 
-        saveBtn = addRenderableWidget(Button.builder(Component.literal("저장"), b -> saveMappingJson())
-                .bounds(this.width - 194, y, 80, 20).build());
+        // live preview toggle + save/load
+        int bottomY = this.height - 40;
+        btnLive = addRenderableWidget(Button.builder(Component.literal("▶ Live Preview: OFF"), b -> {
+            livePreview = !livePreview;
+            btnLive.setMessage(Component.literal(livePreview ? "■ Stop Preview" : "▶ Live Preview: OFF"));
+        }).size(160, 20).pos(pad, bottomY).build());
 
-        loadBtn = addRenderableWidget(Button.builder(Component.literal("불러오기"), b -> loadMappingJson())
-                .bounds(this.width - 108, y, 100, 20).build());
+        btnSave = addRenderableWidget(Button.builder(Component.literal("저장"), b -> onSave()).size(80, 20)
+                .pos(this.width - pad - 170, bottomY).build());
+        btnLoad = addRenderableWidget(Button.builder(Component.literal("불러오기"), b -> onLoad()).size(80, 20)
+                .pos(this.width - pad - 82, bottomY).build());
+
+        // mapping list (bottom full width)
+        mappingList = new MappingList(minecraft, this.width - 2*pad, 90, bottomY - 100, pad);
+        addWidget(mappingList);
+
+        // start polling VMC for live capture/preview
+        // (Screen has tick() in 1.20)
     }
 
-    private void updatePageLabels() {
-        int bonePages  = Math.max(1, (int)Math.ceil(boneRows.size()  / (double)perPageLeft));
-        int jointPages = Math.max(1, (int)Math.ceil(jointRows.size() / (double)perPageRight));
-        bonePage = clamp(bonePage, 0, bonePages - 1);
-        jointPage = clamp(jointPage, 0, jointPages - 1);
-
-        if (bonePageBtn != null)  bonePageBtn.setMessage(Component.literal("Page " + (bonePage+1) + "/" + bonePages));
-        if (jointPageBtn != null) jointPageBtn.setMessage(Component.literal("Page " + (jointPage+1) + "/" + jointPages));
-    }
-
-    private void buildData() {
-        boneRows.clear();
-        jointRows.clear();
-
-        // VMC 본 덤프
-        Map<String, Object> bones = reflectCollectBoneMap(reflectGetVmcState());
-        List<String> boneNames = new ArrayList<>(bones.keySet());
-        boneNames.sort(String.CASE_INSENSITIVE_ORDER);
-
-        if (boneNames.isEmpty()) {
-            boneRows.add(new BoneRow("(no VMC state)", "-", null));
-        } else {
-            for (String name : boneNames) {
-                Object tr = bones.get(name);
-                float[] p = extractPos(tr);
-                float[] e = extractEuler(tr);
-                String line = String.format(Locale.ROOT,
-                        "X:%.2f Y:%.2f Z:%.2f | p:%.2f y:%.2f r:%.2f",
-                        p[0], p[1], p[2], e[0], e[1], e[2]);
-                boneRows.add(new BoneRow(name, line, name));
-            }
-        }
-
-        // URDF 조인트 덤프
-        URDFRobotModel model = reflectGetRobotModel(renderer);
-        if (model == null || model.joints == null || model.joints.isEmpty()) {
-            jointRows.add(new JointRow("(no URDF model)", "", null));
-        } else {
-            for (URDFJoint j : model.joints) {
-                String name = j.name != null ? j.name : "(unnamed)";
-                float curDeg = (float) Math.toDegrees(j.currentPosition);
-                String limTxt;
-                if (j.limit != null && (j.limit.upper > j.limit.lower)) {
-                    int lo = Math.round((float) Math.toDegrees(j.limit.lower));
-                    int hi = Math.round((float) Math.toDegrees(j.limit.upper));
-                    limTxt = String.format(Locale.ROOT, "cur:%d° | lim:[%d°, %d°]", Math.round(curDeg), lo, hi);
-                } else {
-                    limTxt = String.format(Locale.ROOT, "cur:%d° | lim:(none)", Math.round(curDeg));
-                }
-                jointRows.add(new JointRow(name, limTxt, name));
-            }
-        }
-
-        bonePage = 0;
-        jointPage = 0;
-    }
-
-    // ---------- 입력/틱 ----------
     @Override
     public void tick() {
         super.tick();
-        // 자동 새로고침(약 1초)
-        if (++autoRefreshTicker >= 20) {
-            autoRefreshTicker = 0;
-            buildData();
-            updatePageLabels();
+        // refresh VMC state for capture/preview
+        vmcState = reflectGetVmcState();
+
+        if (capturing && vmcState != null && selectedBone != null && selectedJointObj != null) {
+            Map<String, Object> bones = reflectCollectBoneMap(vmcState);
+            Object tr = bones.get(selectedBone);
+            if (tr != null) {
+                float boneVal = extractValue(curMode, curComponent, tr);
+                Float jdeg = reflectGetJointAngle(selectedJointObj);
+                if (jdeg != null) {
+                    capBone.add(boneVal);
+                    capJoint.add(jdeg);
+                }
+            }
         }
-        // 기록 중이면 샘플 수집
-        if (recording && wizard != null && selectedJoint != null) {
-            Object vmc = reflectGetVmcState();
-            Object tr = wizard.pickVmcTransform(vmc);
-            float jointAngle = wizard.readJointAngleRad(selectedJoint);
-            wizard.onTick(tr, jointAngle);
+
+        if (livePreview && vmcState != null && !mappingList.children().isEmpty()) {
+            applyCurrentMappings(vmcState);
+        }
+
+        // update joint slider limits if selection changed
+        if (selectedJointObj != null) {
+            float lo = selectedJointObj.limit != null ? (float) selectedJointObj.limit.lower : -3.14159f;
+            float hi = selectedJointObj.limit != null ? (float) selectedJointObj.limit.upper : 3.14159f;
+            jointSlider.setRange(lo, hi);
         }
     }
 
-    // ---------- 렌더 ----------
     @Override
     public void render(GuiGraphics g, int mouseX, int mouseY, float partialTicks) {
-        // 1) 배경
-        g.fill(0, 0, this.width, this.height, BG_COLOR);
+        this.renderBackground(g, mouseX, mouseY, partialTicks);
 
-        // 2) 좌/우 패널
-        g.fill(leftX,  listTop, leftX  + colWidth, listTop + listHeight, PANEL_COLOR);
-        g.fill(rightX, listTop, rightX + colWidth, listTop + listHeight, PANEL_COLOR);
+        final int pad = 8;
+        final int titleY = 6;
+        final int leftX = pad;
+        final int colW  = (this.width - 3*pad) / 2;
+        final int rightX = leftX + colW + pad;
+        final int listTop = 24 + pad;
+        final int listH  = Math.max(120, this.height - listTop - 180);
 
-        // 3) 기본 위젯
+        // panels
+        g.fill(leftX,  listTop, leftX  + colW,  listH + listTop,  COLOR_PANEL);
+        g.fill(rightX, listTop, rightX + colW,  listH + listTop,  COLOR_PANEL);
+
+        // titles
+        g.drawString(this.font, "VMC Bones (choose one, move joints, map)", leftX,  titleY, COLOR_TITLE, false);
+        g.drawString(this.font, "URDF Joints (select & drive)",             rightX, titleY, COLOR_TITLE, false);
+
         super.render(g, mouseX, mouseY, partialTicks);
 
-        // 4) 최상층 텍스트
-        g.pose().pushPose();
-        g.pose().translate(0, 0, 1000.0f);
+        // selection readout
+        int y = listTop + listH + 8 + 24;
+        String s1 = "Bone: "  + (selectedBone     != null ? selectedBone     : "(none)");
+        String s2 = "Joint: " + (selectedJoint    != null ? selectedJoint    : "(none)");
+        String s3 = "Mode: "  + (curMode == VMCMapping.ExtractionMode.AXIS_PROJECTION
+                        ? String.format(Locale.ROOT, "AXIS[%.2f, %.2f, %.2f]  m=%.3f  c=%.3f", ax,ay,az,fitM,fitC)
+                        : String.format(Locale.ROOT, "%s  m=%.3f  c=%.3f", curMode.name(), fitM, fitC));
+        g.drawString(this.font, s1 + "    |    " + s2, leftX, y, COLOR_TEXT, false);
+        g.drawString(this.font, s3, leftX, y + 16, COLOR_SUB, false);
 
-        // 제목
-        g.drawString(this.font, "VMC Bones (클릭: 선택) — 본을 고른 뒤, 오른쪽에서 관절을 골라 위저드를 진행", leftX, 6, TITLE_LEFT_COLOR, false);
-        g.drawString(this.font, "URDF Joints (클릭: 선택) — 관절을 한 축으로만 왕복해서 매핑", rightX, 6, TITLE_RIGHT_COLOR, false);
-
-        // 좌측 리스트
-        int y = listTop + 4;
-        int start = bonePage * perPageLeft;
-        int end = Math.min(boneRows.size(), start + perPageLeft);
-        for (int i = start; i < end; i++) {
-            BoneRow r = boneRows.get(i);
-            int col = (Objects.equals(selectedBone, r.selKey) ? 0xFFFFC040 : TEXT_LEFT_COLOR);
-            g.drawString(this.font, r.name, leftX + 4, y, col, false);
-            int nx = leftX + 4 + this.font.width(r.name) + 6;
-            g.drawString(this.font, r.detail, nx, y, TEXT_LEFT_SUB, false);
-
-            // 클릭 검출(간단 hit)
-            if (mouseY >= y && mouseY < y + 12 && mouseX >= leftX && mouseX < leftX + colWidth && isMouseDown()) {
-                selectedBone = r.selKey;
-                status = "선택된 본: " + selectedBone;
-            }
-            y += 12;
+        // capture preview sparkline
+        int chartY = y + 40;
+        int w = this.width - 2*pad;
+        int h = 60;
+        g.fill(pad,   chartY,         pad + w,     chartY + h, 0x22111111);
+        if (capBone.size() > 1) {
+            drawSeries(g, pad, chartY, w, h, capBone, 0xFF3ECF8E);
+            drawSeries(g, pad, chartY, w, h, capJoint, 0xFFE97C20);
         }
 
-        // 우측 리스트
-        y = listTop + 4;
-        start = jointPage * perPageRight;
-        end = Math.min(jointRows.size(), start + perPageRight);
-        for (int i = start; i < end; i++) {
-            JointRow r = jointRows.get(i);
-            int col = (Objects.equals(selectedJoint, r.selKey) ? 0xFF80FF80 : TEXT_RIGHT_COLOR);
-            g.drawString(this.font, r.name, rightX + 4, y, col, false);
-            int nx = rightX + 4 + this.font.width(r.name) + 6;
-            g.drawString(this.font, r.detail, nx, y, TEXT_RIGHT_SUB, false);
-
-            if (mouseY >= y && mouseY < y + 12 && mouseX >= rightX && mouseX < rightX + colWidth && isMouseDown()) {
-                selectedJoint = r.selKey;
-                status = "선택된 관절: " + selectedJoint;
-            }
-            y += 12;
-        }
-
-        // 상태
-        if (!status.isEmpty()) g.drawString(this.font, status, 8, this.height - 48, 0x80FF80, false);
-
-        // 현재 선택 표시
-        String sel = "선택: VMC=" + (selectedBone==null?"(없음)":selectedBone)
-                + " / URDF=" + (selectedJoint==null?"(없음)":selectedJoint)
-                + (recording ? "  [기록중]" : "");
-        g.drawString(this.font, sel, 8, this.height - 64, 0xA0A0A0, false);
-
-        g.pose().popPose();
-    }
-
-    private boolean mouseDownCache = false;
-    private boolean isMouseDown() {
-        boolean now = Minecraft.getInstance().mouseHandler.isLeftPressed();
-        boolean ret = now && !mouseDownCache;
-        mouseDownCache = now;
-        return ret;
+        // status line
+        g.drawString(this.font, status, pad, this.height - 20, COLOR_TEXT, false);
     }
 
     @Override
@@ -381,302 +316,457 @@ public class URDFMotionEditor extends Screen {
         this.minecraft.setScreen(this.parent);
     }
 
-    /* ---------------- 데이터 행 ---------------- */
-    private static class BoneRow {
-        final String name, detail, selKey;
-        BoneRow(String n, String d, String k) { name = n; detail = d; selKey = k; }
-    }
-    private static class JointRow {
-        final String name, detail, selKey;
-        JointRow(String n, String d, String k) { name = n; detail = d; selKey = k; }
-    }
+    // =============== Mapping add/update & Save/Load ==============
 
-    /* ---------------- VMC reflection ---------------- */
-    private Object reflectGetVmcState() {
-        try {
-            Class<?> mgr = Class.forName("top.fifthlight.armorstand.vmc.VmcMarionetteManager");
-            Method getState = mgr.getMethod("getState");
-            return getState.invoke(null);
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    @SuppressWarnings("unchecked")
-    private Map<String, Object> reflectCollectBoneMap(Object vmcState) {
-        Map<String, Object> out = new HashMap<>();
-        if (vmcState == null) return out;
-
-        Object mapObj = null;
-
-        // 1) 필드 후보
-        String[] fieldCandidates = { "boneTransforms", "bones", "transforms" };
-        for (String fname : fieldCandidates) {
-            try {
-                Field f;
-                try {
-                    f = vmcState.getClass().getField(fname);
-                } catch (NoSuchFieldException e) {
-                    f = vmcState.getClass().getDeclaredField(fname);
-                    f.setAccessible(true);
-                }
-                mapObj = f.get(vmcState);
-                if (mapObj != null) break;
-            } catch (Throwable ignored) {}
+    private void onAddOrUpdateMapping() {
+        if (selectedBone == null || selectedJoint == null) { status = "본/조인트를 선택하세요."; return; }
+        VMCMapping m = findMapping(selectedBone, selectedJoint);
+        if (m == null) {
+            m = new VMCMapping();
+            m.vmcBone   = selectedBone;
+            m.urdfJoint = selectedJoint;
+            mappingList.children().add(new MappingList.Entry(m, mappingList));
         }
-
-        // 2) 메서드 후보
-        if (mapObj == null) {
-            String[] methodCandidates = { "getBoneTransforms", "boneTransforms", "getBones", "getTransforms" };
-            for (String mname : methodCandidates) {
-                try {
-                    Method m = vmcState.getClass().getMethod(mname);
-                    mapObj = m.invoke(vmcState);
-                    if (mapObj != null) break;
-                } catch (Throwable ignored) {}
-            }
-        }
-
-        if (!(mapObj instanceof Map)) return out;
-
-        Map<Object, Object> m = (Map<Object, Object>) mapObj;
-        for (Map.Entry<Object, Object> e : m.entrySet()) {
-            Object key = e.getKey();
-            String name = null;
-            if (key != null) {
-                try { if (key instanceof Enum) name = ((Enum<?>) key).name(); } catch (Throwable ignored) {}
-                if (name == null) {
-                    try { Method nameM = key.getClass().getMethod("name"); Object n = nameM.invoke(key); if (n != null) name = n.toString(); } catch (Throwable ignored) {}
-                }
-                if (name == null) name = key.toString();
-            } else name = "(null)";
-            out.put(name, e.getValue());
-        }
-        return out;
+        m.multiplier = this.fitM;
+        m.offset     = this.fitC;
+        m.mode       = this.curMode;
+        m.component  = this.curMode == VMCMapping.ExtractionMode.AXIS_PROJECTION ? "AXIS" : toComponent(curMode);
+        m.ax = ax; m.ay = ay; m.az = az;
+        mappingList.setDirty();
+        status = "매핑 저장 완료: " + m.label();
+    }
+    private void onRemoveSelected() {
+        MappingList.Entry e = mappingList.getSelected();
+        if (e == null) { status = "삭제할 매핑을 선택하세요."; return; }
+        mappingList.children().remove(e);
+        status = "삭제 완료: " + e.mapping.vmcBone + " → " + e.mapping.urdfJoint;
+    }
+    private String toComponent(VMCMapping.ExtractionMode m) {
+        return switch (m) {
+            case EULER_X -> "X";
+            case EULER_Y -> "Y";
+            case EULER_Z -> "Z";
+            case QUATERNION_ANGLE -> "ANGLE";
+            case AXIS_PROJECTION -> "AXIS";
+        };
     }
 
-    private static float[] extractPos(Object transform) {
-        float[] r = {0, 0, 0};
-        if (transform == null) return r;
+    private void onSave() {
+        Path file = getMappingFile();
+        VMCMappingSet set = new VMCMappingSet();
+        for (var e : mappingList.children()) set.mappings.add(e.mapping);
         try {
-            Object pos = transform.getClass().getField("position").get(transform);
-            Method mx = pos.getClass().getMethod("x");
-            Method my = pos.getClass().getMethod("y");
-            Method mz = pos.getClass().getMethod("z");
-            r[0] = (Float) mx.invoke(pos);
-            r[1] = (Float) my.invoke(pos);
-            r[2] = (Float) mz.invoke(pos);
-        } catch (Throwable ignored) {}
-        return r;
-    }
-
-    private static float[] extractEuler(Object transform) {
-        float[] r = {0, 0, 0};
-        if (transform == null) return r;
-        try {
-            Object rot = transform.getClass().getField("rotation").get(transform);
-            Method mx = rot.getClass().getMethod("x");
-            Method my = rot.getClass().getMethod("y");
-            Method mz = rot.getClass().getMethod("z");
-            Method mw = rot.getClass().getMethod("w");
-            float qx = (Float) mx.invoke(rot);
-            float qy = (Float) my.invoke(rot);
-            float qz = (Float) mz.invoke(rot);
-            float qw = (Float) mw.invoke(rot);
-            Vector3f e = new Vector3f();
-            new Quaternionf(qx, qy, qz, qw).getEulerAnglesXYZ(e);
-            r[0] = e.x; r[1] = e.y; r[2] = e.z;
-        } catch (Throwable ignored) {}
-        return r;
-    }
-
-    /* ---------------- URDF access ---------------- */
-    private URDFRobotModel reflectGetRobotModel(Object renderer) {
-        try {
-            Method m = renderer.getClass().getMethod("getRobotModel");
-            return (URDFRobotModel) m.invoke(renderer);
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    private String reflectGetModelDir() {
-        try {
-            Method m = renderer.getClass().getMethod("GetModelDir");
-            Object r = m.invoke(renderer);
-            return r == null ? null : r.toString();
-        } catch (Throwable ignored) {}
-        return null;
-    }
-
-    /* ---------------- 매핑 I/O ---------------- */
-    private Path mappingPath() {
-        String dir = reflectGetModelDir();
-        return Paths.get(dir == null ? "." : dir, "vmc_mapping.json");
-    }
-
-    private void saveMappingJson() {
-        try {
-            Path p = mappingPath();
-            Files.createDirectories(p.getParent());
-            String json = gson.toJson(mapping);
-            Files.writeString(p, json);
-            status = "매핑 저장: " + p;
+            Files.createDirectories(file.getParent());
+            Files.writeString(file, gson.toJson(set));
+            status = "저장 완료: " + file;
         } catch (IOException e) {
             status = "저장 실패: " + e.getMessage();
         }
     }
 
-    private void loadMappingJson() {
+    private void onLoad() {
+        Path file = getMappingFile();
+        if (!Files.exists(file)) { status = "파일 없음: " + file; return; }
         try {
-            Path p = mappingPath();
-            if (!Files.exists(p)) { status = "파일 없음: " + p; return; }
-            String json = Files.readString(p);
-            VMCURDFMapping m = new Gson().fromJson(json, VMCURDFMapping.class);
-            if (m != null) mapping = m;
-            status = "매핑 불러오기: " + p;
+            String json = Files.readString(file);
+            VMCMappingSet set = gson.fromJson(json, VMCMappingSet.class);
+            mappingList.children().clear();
+            if (set != null && set.mappings != null) {
+                for (VMCMapping m : set.mappings) {
+                    mappingList.children().add(new MappingList.Entry(m, mappingList));
+                }
+            }
+            mappingList.setDirty();
+            status = "불러오기 완료: " + file;
         } catch (IOException e) {
             status = "불러오기 실패: " + e.getMessage();
         }
     }
 
-    /* ---------------- 매핑 갱신 ---------------- */
-    private void addJointComponentToMapping(String vmcBone, VMCURDFMapping.JointComponent jc) {
-        if (vmcBone == null || jc == null) return;
-        VMCURDFMapping.BoneMapping bm = null;
-        for (var b : mapping.mappings) if (vmcBone.equals(b.vmcBone)) { bm = b; break; }
-        if (bm == null) {
-            bm = new VMCURDFMapping.BoneMapping();
-            bm.vmcBone = vmcBone;
-            mapping.mappings.add(bm);
+    private Path getMappingFile() {
+        String dir = reflectGetModelDir();
+        if (dir == null || dir.isEmpty()) {
+            File c = new File(".");
+            return c.toPath().resolve("vmc_mapping.json");
         }
-        bm.joints.add(jc); // ★ 순서가 곧 체인 순서
+        return Paths.get(dir, "vmc_mapping.json");
     }
 
-    /* ---------------- 매핑 위저드 ---------------- */
-    private static float axisProjectedAngle(Quaternionf q, float ax, float ay, float az) {
-        float w=q.w(), x=q.x(), y=q.y(), z=q.z();
-        float dot = x*ax + y*ay + z*az;
-        return (float)(2.0 * Math.atan2(dot, w));
-    }
-
-    private static final class Stats {
-        static class Fit { float m,b,r; }
-        static Fit fit(float[] x, float[] y) {
-            int n=Math.min(x.length,y.length);
-            double sx=0,sy=0,sxx=0,syy=0,sxy=0;
-            for(int i=0;i<n;i++){ sx+=x[i]; sy+=y[i]; sxx+=x[i]*x[i]; syy+=y[i]*y[i]; sxy+=x[i]*y[i]; }
-            double denom = n*sxx - sx*sx;
-            Fit f=new Fit();
-            if (Math.abs(denom)<1e-9){ f.m=0; f.b=(float)(sy/n); f.r=0; return f; }
-            f.m=(float)((n*sxy - sx*sy)/denom);
-            f.b=(float)((sy - f.m*sx)/n);
-            double cov = sxy/n - (sx/n)*(sy/n);
-            double vx  = sxx/n - (sx/n)*(sx/n);
-            double vy  = syy/n - (sy/n)*(sy/n);
-            f.r=(float)(cov/(Math.sqrt(vx)*Math.sqrt(vy)+1e-9));
-            return f;
+    private VMCMapping findMapping(String bone, String joint) {
+        for (var e : mappingList.children()) {
+            if (Objects.equals(e.mapping.vmcBone, bone) && Objects.equals(e.mapping.urdfJoint, joint))
+                return e.mapping;
         }
+        return null;
     }
 
-    private final class MappingWizard {
-        final String vmcBone;
-        final Object renderer;
-        final List<Float> xs=new ArrayList<>(), ys=new ArrayList<>();
-        URDFJoint currentJoint; float[] useAxis;
+    // ==================== Lists & widgets =====================
 
-        MappingWizard(String vmcBone, Object renderer){ this.vmcBone=vmcBone; this.renderer=renderer; }
-
-        void beginJoint(String jointName) {
-            currentJoint = findJoint(jointName);
-            useAxis = null;
-            if (currentJoint != null && currentJoint.axis != null && currentJoint.axis.xyz != null) {
-                float ax=currentJoint.axis.xyz.x, ay=currentJoint.axis.xyz.y, az=currentJoint.axis.xyz.z;
-                float n=(float)Math.sqrt(ax*ax+ay*ay+az*az);
-                if (n>=1e-6) useAxis = new float[]{ax/n, ay/n, az/n};
+    private void rebuildBoneList() {
+        boneList.children().clear();
+        // try live bones, else fallback list
+        Map<String, Object> bones = reflectCollectBoneMap(reflectGetVmcState());
+        if (bones.isEmpty()) {
+            for (String b : FALLBACK_VRM_BONES) {
+                boneList.children().add(new BoneList.Entry(b, () -> {
+                    selectedBone = b; status = "선택: " + b;
+                }));
             }
-            xs.clear(); ys.clear();
+        } else {
+            ArrayList<String> names = new ArrayList<>(bones.keySet());
+            names.sort(String.CASE_INSENSITIVE_ORDER);
+            for (String b : names) {
+                boneList.children().add(new BoneList.Entry(b, () -> {
+                    selectedBone = b; status = "선택: " + b;
+                }));
+            }
         }
+    }
 
-        void onTick(Object vmcTransform, float jointAngleRad) {
-            if (currentJoint==null || vmcTransform==null) return;
-            Quaternionf q = readQuat(vmcTransform); if (q==null) return;
+    private void rebuildJointList() {
+        jointList.children().clear();
+        model = reflectGetRobotModel(); // refresh
+        if (model == null || model.joints == null) return;
+        for (URDFJoint j : model.joints) {
+            final String jname = j.name != null ? j.name : "(unnamed)";
+            jointList.children().add(new JointList.Entry(jname, () -> {
+                selectedJoint = jname;
+                selectedJointObj = j;
+                // slider range
+                float lo = (j.limit != null) ? (float) j.limit.lower : -3.14159f;
+                float hi = (j.limit != null) ? (float) j.limit.upper : 3.14159f;
+                jointSlider.setRange(lo, hi);
+                // default axis from joint
+                float[] axis = reflectGetJointAxis(j);
+                if (axis != null) { ax = axis[0]; ay = axis[1]; az = axis[2]; normAxis(); }
+                status = "선택: " + selectedJoint;
+            }, j));
+        }
+    }
 
-            float x;
-            if (useAxis!=null) {
-                x = axisProjectedAngle(q, useAxis[0], useAxis[1], useAxis[2]);
+    private void drawSeries(GuiGraphics g, int x, int y, int w, int h, List<Float> data, int color) {
+        if (data.size() < 2) return;
+        float min = Float.MAX_VALUE, max = -Float.MAX_VALUE;
+        for (float v : data) { if (v<min) min=v; if (v>max) max=v; }
+        if (Math.abs(max-min) < 1e-6f) { max = min + 1e-3f; }
+        float prevX = x, prevY = y + h - (data.get(0)-min)/(max-min)*h;
+        for (int i=1;i<data.size();i++) {
+            float nx = x + (i * (w-2f) / (data.size()-1));
+            float ny = y + h - (data.get(i)-min)/(max-min)*h;
+            g.hLine((int)prevX, (int)nx, (int)prevY, color);
+            prevX = nx; prevY = ny;
+        }
+    }
+
+    private static class BoneList extends ObjectSelectionList<BoneList.Entry> {
+        final int left;
+        public BoneList(Minecraft mc, int width, int height, int top, int left) {
+            super(mc, width, height, top, top + height);
+            this.left = left;
+        }
+        @Override public int getRowWidth() { return this.width - 8; }
+        @Override public int getRowLeft()  { return this.left + 4; }
+        @Override public int getX()        { return this.left; }
+        @Override public int getRowHeight() { return 16; }
+        static class Entry extends ObjectSelectionList.Entry<Entry> {
+            final String name; final Runnable cb;
+            Entry(String n, Runnable cb) { this.name=n; this.cb=cb; }
+            @Override public void render(GuiGraphics g, int idx, int top, int left, int width, int height, int mouseX, int mouseY, boolean hovered, float partialTicks) {
+                g.drawString(Minecraft.getInstance().font, name, left+2, top+2, 0xFFFFFFFF, false);
+            }
+            @Override public boolean mouseClicked(double mx, double my, int btn) {
+                if (btn==0) { cb.run(); this.select(); return true; }
+                return false;
+            }
+            @Override public Component getNarration() { return Component.literal(name); }
+        }
+    }
+
+    private static class JointList extends ObjectSelectionList<JointList.Entry> {
+        final int left;
+        public JointList(Minecraft mc, int width, int height, int top, int left) {
+            super(mc, width, height, top, top + height);
+            this.left = left;
+        }
+        @Override public int getRowWidth() { return this.width - 8; }
+        @Override public int getRowLeft()  { return this.left + 4; }
+        @Override public int getX()        { return this.left; }
+        @Override public int getRowHeight() { return 16; }
+
+        static class Entry extends ObjectSelectionList.Entry<Entry> {
+            final String name;
+            final Runnable cb;
+            final URDFJoint joint;
+            Entry(String name, Runnable cb, URDFJoint j) { this.name=name; this.cb=cb; this.joint=j; }
+            @Override public void render(GuiGraphics g, int idx, int top, int left, int width, int height, int mouseX, int mouseY, boolean hovered, float pt) {
+                String lim = "";
+                if (joint != null) {
+                    float cur = (float) (joint.currentPosition);
+                    float lo  = joint.limit != null ? (float)joint.limit.lower : Float.NaN;
+                    float hi  = joint.limit != null ? (float)joint.limit.upper : Float.NaN;
+                    String curS = String.format(Locale.ROOT, "θ=%.2f°", Math.toDegrees(cur));
+                    String limS = (Float.isFinite(lo) && Float.isFinite(hi))
+                            ? String.format(Locale.ROOT, " [%d°, %d°]", Math.round(Math.toDegrees(lo)), Math.round(Math.toDegrees(hi)))
+                            : " [free]";
+                    lim = "  " + curS + limS;
+                }
+                g.drawString(Minecraft.getInstance().font, name + lim, left + 2, top + 2, 0xFFFFFFFF, false);
+            }
+            @Override public boolean mouseClicked(double mx, double my, int btn) {
+                if (btn==0) { cb.run(); this.select(); return true; }
+                return false;
+            }
+            @Override public Component getNarration() { return Component.literal(name); }
+        }
+    }
+
+    private static class MappingList extends ObjectSelectionList<MappingList.Entry> {
+        final int left;
+        private boolean dirty = false;
+        public MappingList(Minecraft mc, int width, int height, int top, int left) {
+            super(mc, width, height, top, top + height);
+            this.left = left;
+        }
+        @Override public int getRowWidth() { return this.width - 8; }
+        @Override public int getRowLeft()  { return this.left + 4; }
+        @Override public int getX()        { return this.left; }
+        @Override public int getRowHeight(){ return 16; }
+        public void setDirty() { this.dirty = true; }
+        public Entry getSelected() { return super.getSelected(); }
+        @Override public void render(GuiGraphics g, int mx, int my, float pt) {
+            if (dirty) { // re-render text on demand
+                dirty = false;
+            }
+            super.render(g, mx, my, pt);
+        }
+        static class Entry extends ObjectSelectionList.Entry<Entry> {
+            final MappingList owner; final VMCMapping mapping;
+            Entry(VMCMapping m, MappingList owner){ this.mapping=m; this.owner=owner; }
+            @Override
+            public void render(GuiGraphics g, int idx, int top, int left, int width, int height, int mx, int my, boolean hovered, float pt) {
+                g.drawString(Minecraft.getInstance().font, "• " + mapping.label(), left+2, top+2, 0xFFECECEC, false);
+            }
+            @Override public boolean mouseClicked(double mx, double my, int btn) {
+                if (btn==0) { owner.setSelected(this); return true; }
+                return false;
+            }
+            @Override public Component getNarration() { return Component.literal(mapping.label()); }
+        }
+    }
+
+    /** simple horizontal slider to drive selected joint (1.20: no AbstractSliderButton, so hand-rolled) */
+    private static class JointScrubSlider extends Button {
+        private float value, min, max;
+        private final SliderListener listener;
+        private boolean dragging = false;
+        public interface SliderListener { void onValue(float v); }
+        public JointScrubSlider(int x, int y, int w, int h, float min, float max, SliderListener l) {
+            super(x, y, w, h, Component.empty(), b->{} , DEFAULT_NARRATION);
+            this.listener = l; this.min = min; this.max = max; this.value = 0f;
+            setMessage(label());
+        }
+        public void setRange(float min, float max){ this.min=min; this.max=max; setMessage(label()); }
+        public void setValue(float v){ this.value = clamp(v); setMessage(label()); }
+        private float clamp(float v){ return Math.max(min, Math.min(max, v)); }
+        private Component label(){ return Component.literal(String.format(Locale.ROOT,"Angle: %.2f°", Math.toDegrees(value))); }
+        @Override public void onClick(double mouseX, double mouseY) { dragging = true; setFromMouse(mouseX); }
+        @Override protected void onDrag(double x, double y, double dx, double dy) { setFromMouse(x); }
+        @Override public void onRelease(double x, double y) { dragging = false; }
+        private void setFromMouse(double mx) {
+            float t = (float)((mx - getX()) / (float)getWidth()); t = Math.max(0, Math.min(1, t));
+            value = min + (max - min) * t; setMessage(label()); if (listener != null) listener.onValue(value);
+        }
+    }
+
+    // ============== VMC value extraction & mapping apply ==============
+
+    private float[] axisForCurrent() {
+        float nx = ax, ny = ay, nz = az;
+        float len = (float)Math.sqrt(nx*nx + ny*ny + nz*nz);
+        if (len < 1e-6f) { // fallback to joint axis if possible
+            if (selectedJointObj != null) {
+                float[] a = reflectGetJointAxis(selectedJointObj);
+                if (a != null) { nx = a[0]; ny=a[1]; nz=a[2]; len=(float)Math.sqrt(nx*nx+ny*ny+nz*nz); }
+            }
+        }
+        if (len < 1e-6f) { nx=0; ny=1; nz=0; }
+        return new float[]{ nx/len, ny/len, nz/len };
+    }
+
+    private float extractValue(VMCMapping.ExtractionMode mode, String component, Object tr) {
+        Quaternionf q = reflectGetQuat(tr);
+        if (q == null) return 0f;
+        switch (mode) {
+            case QUATERNION_ANGLE: {
+                float w = q.w(); double ang = 2.0 * Math.acos(Math.max(-1.0, Math.min(1.0, w)));
+                return (float)ang;
+            }
+            case EULER_X: case EULER_Y: case EULER_Z: {
+                Vector3f e = new Vector3f();
+                new Quaternionf(q).getEulerAnglesXYZ(e); // X, Y, Z
+                return switch (mode) {
+                    case EULER_X -> e.x;
+                    case EULER_Y -> e.y;
+                    case EULER_Z -> e.z;
+                    default -> 0f;
+                };
+            }
+            case AXIS_PROJECTION: {
+                float[] a = axisForCurrent();
+                float dot = q.x()*a[0] + q.y()*a[1] + q.z()*a[2];
+                return (float)(2.0 * Math.atan2(dot, q.w()));
+            }
+        }
+        return 0f;
+    }
+
+    private void applyCurrentMappings(Object vmcStateObj) {
+        Map<String, Object> bones = reflectCollectBoneMap(vmcStateObj);
+        for (var entry : mappingList.children()) {
+            VMCMapping m = entry.mapping;
+            Object tr = bones.get(m.vmcBone);
+            if (tr == null) continue;
+
+            float val;
+            if (m.mode == VMCMapping.ExtractionMode.AXIS_PROJECTION) {
+                float len = (float)Math.sqrt(m.ax*m.ax + m.ay*m.ay + m.az*m.az);
+                float axN = len > 1e-6f ? m.ax/len : 0f;
+                float ayN = len > 1e-6f ? m.ay/len : 1f;
+                float azN = len > 1e-6f ? m.az/len : 0f;
+                Quaternionf q = reflectGetQuat(tr);
+                float dot = q.x()*axN + q.y()*ayN + q.z()*azN;
+                val = (float)(2.0 * Math.atan2(dot, q.w()));
             } else {
-                Vector3f e = new Vector3f(); q.getEulerAnglesZYX(e); // (x=roll,y=pitch,z=yaw)
-                x = e.y; // 축 정보 없으면 일단 pitch 성분
+                val = extractValue(m.mode, m.component, tr);
             }
-            xs.add(x);
-            ys.add(jointAngleRad);
-        }
+            float out = val * m.multiplier + m.offset;
 
-        VMCURDFMapping.JointComponent finalizeStep() {
-            if (currentJoint==null || xs.size()<20) return null;
-            float[] x=new float[xs.size()], y=new float[ys.size()];
-            for(int i=0;i<x.length;i++){ x[i]=xs.get(i); y[i]=ys.get(i); }
-            Stats.Fit fit = Stats.fit(x,y);
-            if (Math.abs(fit.r) < 0.6f) return null;
-
-            VMCURDFMapping.JointComponent jc = new VMCURDFMapping.JointComponent();
-            jc.jointName = currentJoint.name;
-            if (useAxis != null) {
-                jc.mode = VMCURDFMapping.ExtractMode.AXIS_PROJ;
-                jc.axis = useAxis;
-                // 의미 레이블 힌트(이름 기반)
-                String n = currentJoint.name.toLowerCase(Locale.ROOT);
-                if (n.contains("yaw")||n.contains("_z")) jc.component=VMCURDFMapping.RotationComponent.YAW;
-                else if (n.contains("roll")||n.contains("_x")) jc.component=VMCURDFMapping.RotationComponent.ROLL;
-                else jc.component=VMCURDFMapping.RotationComponent.PITCH;
-            } else {
-                jc.mode = VMCURDFMapping.ExtractMode.EULER;
-                jc.eulerOrder = VMCURDFMapping.EulerOrder.ZYX;
-                jc.component = VMCURDFMapping.RotationComponent.PITCH;
+            // clamp to joint limit
+            URDFJoint j = model != null ? model.findJointByName(m.urdfJoint) : null;
+            if (j != null && j.limit != null && j.limit.upper > j.limit.lower) {
+                float lo = (float)j.limit.lower, hi = (float)j.limit.upper;
+                if (out < lo) out = lo;
+                if (out > hi) out = hi;
             }
-            jc.multiplier = fit.m;
-            jc.offset     = fit.b;
-            return jc;
-        }
-
-        Object pickVmcTransform(Object vmcState) {
-            Map<String,Object> m = reflectCollectBoneMap(vmcState);
-            return m.getOrDefault(vmcBone, null);
-        }
-
-        float readJointAngleRad(String name) {
-            URDFRobotModel model = reflectGetRobotModel(renderer);
-            if (model==null || model.joints==null) return 0f;
-            for (URDFJoint j : model.joints) if (name.equals(j.name)) return j.currentPosition;
-            return 0f;
-        }
-
-        URDFJoint findJoint(String n){
-            URDFRobotModel m=reflectGetRobotModel(renderer);
-            if(m==null) return null;
-            for(URDFJoint j:m.joints) if(n.equals(j.name)) return j;
-            return null;
+            reflectSetJointPreview(m.urdfJoint, out);
         }
     }
 
-    /* ---------------- 유틸 ---------------- */
-    private static int clamp(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
-    private static Vector3f readPos(Object tr) {
+    private float[] fitLine(List<Float> x, List<Float> y) {
+        double sx=0, sy=0, sxx=0, sxy=0;
+        int n = Math.min(x.size(), y.size());
+        for (int i=0;i<n;i++) { float xi=x.get(i), yi=y.get(i); sx+=xi; sy+=yi; sxx+=xi*xi; sxy+=xi*yi; }
+        double denom = n>1 ? (n*sxx - sx*sx) : 1.0;
+        double m = denom!=0 ? (n* sxy - sx*sy) / denom : 0.0;
+        double c = (sy - m*sx)/ Math.max(1.0, n);
+        return new float[]{ (float)m, (float)c };
+    }
+
+    // ============== Reflection helpers (renderer & VMC) ==============
+
+    private URDFRobotModel reflectGetRobotModel() {
         try {
-            Object p = tr.getClass().getField("position").get(tr);
-            float x = (float)p.getClass().getMethod("x").invoke(p);
-            float y = (float)p.getClass().getMethod("y").invoke(p);
-            float z = (float)p.getClass().getMethod("z").invoke(p);
-            return new Vector3f(x,y,z);
+            if (renderer == null) return null;
+            Class<?> c = renderer.getClass();
+            Method m = null;
+            try { m = c.getMethod("getRobotModel"); }
+            catch (NoSuchMethodException ignore) {
+                // fallback to field
+                try { Field f = c.getDeclaredField("robotModel"); f.setAccessible(true); return (URDFRobotModel) f.get(renderer); }
+                catch (Throwable ignored) {}
+            }
+            if (m != null) return (URDFRobotModel)m.invoke(renderer);
+        } catch (Throwable ignored) { }
+        return null;
+    }
+
+    private void reflectSetJointPreview(String name, float v) {
+        try {
+            if (renderer == null) return;
+            Method m = null;
+            try { m = renderer.getClass().getMethod("setJointPreview", String.class, float.class); }
+            catch (NoSuchMethodException ex) {
+                // optional legacy method name
+                try { m = renderer.getClass().getMethod("setJoint", String.class, float.class); } catch (Throwable ignored2) {}
+            }
+            if (m != null) m.invoke(renderer, name, v);
+        } catch (Throwable t) {
+            // ignore
+        }
+    }
+
+    private String reflectGetModelDir() {
+        try {
+            if (renderer == null) return null;
+            Method m;
+            try { m = renderer.getClass().getMethod("GetModelDir"); }
+            catch (NoSuchMethodException e) { m = renderer.getClass().getMethod("getModelDir"); }
+            Object r = m.invoke(renderer); return r != null ? r.toString() : null;
         } catch (Throwable ignored) { return null; }
     }
-    private static Quaternionf readQuat(Object tr) {
+
+    private Object reflectGetVmcState() {
         try {
-            Object r = tr.getClass().getField("rotation").get(tr);
-            float x = (float)r.getClass().getMethod("x").invoke(r);
-            float y = (float)r.getClass().getMethod("y").invoke(r);
-            float z = (float)r.getClass().getMethod("z").invoke(r);
-            float w = (float)r.getClass().getMethod("w").invoke(r);
+            Class<?> c = Class.forName("top.fifthlight.armorstand.vmc.VmcMarionetteManager");
+            Method m = c.getMethod("getState");
+            return m.invoke(null);
+        } catch (Throwable ignored) { return null; }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> reflectCollectBoneMap(Object vmcState) {
+        Map<String, Object> map = new HashMap<>();
+        if (vmcState == null) return map;
+        try {
+            Field f = vmcState.getClass().getField("boneTransforms");
+            Object raw = f.get(vmcState);
+            if (!(raw instanceof Map)) return map;
+            Map<Object,Object> src = (Map<Object, Object>) raw;
+            for (var e : src.entrySet()) {
+                Object tag = e.getKey();
+                String name = tag != null ? tag.toString() : "(null)";
+                try {
+                    Method nm = tag.getClass().getMethod("name");
+                    Object v = nm.invoke(tag);
+                    if (v != null) name = v.toString();
+                } catch (Throwable ignored) {}
+                map.put(name, e.getValue());
+            }
+        } catch (Throwable ignored) {}
+        return map;
+    }
+
+    private Quaternionf reflectGetQuat(Object tr) {
+        if (tr == null) return null;
+        try {
+            Object rot = tr.getClass().getField("rotation").get(tr);
+            float x = (Float)rot.getClass().getMethod("x").invoke(rot);
+            float y = (Float)rot.getClass().getMethod("y").invoke(rot);
+            float z = (Float)rot.getClass().getMethod("z").invoke(rot);
+            float w = (Float)rot.getClass().getMethod("w").invoke(rot);
             return new Quaternionf(x,y,z,w);
         } catch (Throwable ignored) { return null; }
+    }
+    private Float reflectGetJointAngle(URDFJoint j) {
+        try { return (float) j.currentPosition; } catch (Throwable t) { return null; }
+    }
+    private float[] reflectGetJointAxis(URDFJoint j) {
+        try {
+            if (j == null || j.axis == null) return null;
+            Field axisField = j.getClass().getField("axis");
+            Object axObj = axisField.get(j); if (axObj == null) return null;
+            Field axF = axObj.getClass().getField("x");
+            Field ayF = axObj.getClass().getField("y");
+            Field azF = axObj.getClass().getField("z");
+            float ax = ((Number)axF.get(axObj)).floatValue();
+            float ay = ((Number)ayF.get(axObj)).floatValue();
+            float az = ((Number)azF.get(axObj)).floatValue();
+            return new float[]{ ax, ay, az };
+        } catch (Throwable ignored) { return null; }
+    }
+
+    private void normAxis() {
+        float n = (float)Math.sqrt(ax*ax + ay*ay + az*az);
+        if (n < 1e-6f) { ax=0; ay=1; az=0; } else { ax/=n; ay/=n; az/=n; }
     }
 }
