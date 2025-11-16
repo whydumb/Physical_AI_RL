@@ -27,8 +27,10 @@ public class KAIMyEntityClient {
 
     public static void initClient() {
         checkKAIMyEntityFolder();
-        MMDModelManager.Init();  // ✅ 이 줄 주석 해제!
-        // MMDTextureManager.Init();  // ← 이건 계속 주석
+        MMDModelManager.Init();  // ✅ MMD 모델 매니저 초기화
+        // MMDTextureManager.Init();  // ← 계속 주석 처리
+
+
         logger.info("KAIMyEntityClient initialized (URDF only)");
     }
 
