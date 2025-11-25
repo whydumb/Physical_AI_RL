@@ -1,6 +1,5 @@
 package com.kAIS.KAIMyEntity.urdf.control;
 
-import com.kAIS.KAIMyEntity.urdf.URDFModelOpenGLWithSTL;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.gui.GuiGraphics;
 import net.minecraft.client.gui.components.Button;
@@ -17,16 +16,16 @@ import net.minecraft.network.chat.Component;
  */
 public class MotionEditorScreen extends Screen {
     private final Screen parent;
-    private final URDFModelOpenGLWithSTL renderer;
+    private final Object renderer; // Generic object to avoid missing class dependency
 
-    private MotionEditorScreen(Screen parent, URDFModelOpenGLWithSTL renderer) {
+    private MotionEditorScreen(Screen parent, Object renderer) {
         super(Component.literal("Motion Editor"));
         this.parent = parent;
         this.renderer = renderer;
     }
 
     /** Opens the editor on the Minecraft client thread. */
-    public static void open(URDFModelOpenGLWithSTL renderer) {
+    public static void open(Object renderer) {
         Minecraft minecraft = Minecraft.getInstance();
         minecraft.execute(() -> minecraft.setScreen(new MotionEditorScreen(minecraft.screen, renderer)));
     }
