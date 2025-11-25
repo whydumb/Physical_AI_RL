@@ -51,7 +51,6 @@ public class VMCListenerController extends Screen {
         int centerX = this.width / 2;
         int startY = this.height / 2 - 50;
 
-        // IP 입력
         this.ipField = new EditBox(this.font,
                 centerX - panelWidth / 2,
                 startY,
@@ -62,7 +61,6 @@ public class VMCListenerController extends Screen {
         this.ipField.setMaxLength(64);
         addRenderableWidget(this.ipField);
 
-        // Port 입력
         this.portField = new EditBox(this.font,
                 centerX - panelWidth / 2,
                 startY + 26,
@@ -73,21 +71,18 @@ public class VMCListenerController extends Screen {
         this.portField.setMaxLength(5);
         addRenderableWidget(this.portField);
 
-        // Connect 버튼
         this.connectButton = Button.builder(Component.literal("Connect / Reconnect"),
                         button -> handleConnect())
                 .bounds(centerX - panelWidth / 2, startY + 52, panelWidth, 20)
                 .build();
         addRenderableWidget(this.connectButton);
 
-        // Robot Control 토글 버튼 (WASD + Mouse 전송 on/off)
         this.toggleControlButton = Button.builder(Component.literal("Enable Robot Control"),
                         button -> handleToggleRobotControl())
                 .bounds(centerX - panelWidth / 2, startY + 78, panelWidth, 20)
                 .build();
         addRenderableWidget(this.toggleControlButton);
 
-        // Close 버튼
         this.closeButton = Button.builder(Component.literal("Close"),
                         button -> onClose())
                 .bounds(centerX - 50, this.height - 32, 100, 20)
@@ -101,14 +96,8 @@ public class VMCListenerController extends Screen {
     @Override
     public void tick() {
         super.tick();
-        if (ipField != null) {
-            ipField.tick();
-        }
-        if (portField != null) {
-            portField.tick();
-        }
+        // EditBox no longer has tick() method in newer Minecraft versions
 
-        // 1초마다 상태 갱신
         if (++refreshTicker >= 20) {
             refreshTicker = 0;
             controller = tryGetController();
@@ -119,10 +108,8 @@ public class VMCListenerController extends Screen {
 
     @Override
     public void render(GuiGraphics graphics, int mouseX, int mouseY, float partialTick) {
-        // 배경
         graphics.fill(0, 0, this.width, this.height, BG_COLOR);
 
-        // 패널
         int panelW = 300;
         int panelH = 150;
         int panelX = this.width / 2 - panelW / 2;
@@ -131,15 +118,12 @@ public class VMCListenerController extends Screen {
 
         super.render(graphics, mouseX, mouseY, partialTick);
 
-        // 타이틀
         graphics.drawCenteredString(this.font, TITLE.getString(),
                 this.width / 2, panelY - 18, TITLE_COLOR);
 
-        // 라벨
         graphics.drawString(this.font, "IP Address", panelX + 10, panelY + 8, TEXT_COLOR, false);
         graphics.drawString(this.font, "Port", panelX + 10, panelY + 34, TEXT_COLOR, false);
 
-        // 상태 표시
         if (controller != null) {
             int statusY = panelY + 90;
 
@@ -163,7 +147,6 @@ public class VMCListenerController extends Screen {
                     this.width / 2, panelY + 90, WARN_COLOR);
         }
 
-        // 하단 상태 메시지
         if (!statusMessage.isEmpty()) {
             graphics.drawCenteredString(this.font, statusMessage,
                     this.width / 2, panelY + panelH + 12, statusColor);
@@ -228,7 +211,6 @@ public class VMCListenerController extends Screen {
 
         boolean hasController = controller != null;
 
-        // Robot control 토글은 컨트롤러만 있으면 활성
         toggleControlButton.active = hasController;
 
         if (connectButton != null) {
