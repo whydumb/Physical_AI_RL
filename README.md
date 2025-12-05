@@ -125,4 +125,3 @@ $$
 \text{Total Optimization} = \underbrace{\Theta(k n^2)}_{\text{Algorithm}} \times \underbrace{\Theta(N^2 V F)}_{\text{Physics Engine}} \times \underbrace{\Omega(|\mathcal{S}|/|\mathcal{M}|)}_{\text{Data Prior}}
 $$
 
-**결과적으로 3060 노트북 GPU 환경에서도 대규모 피지컬 AI 강화 학습이 가능해집니다.**
