@@ -1,5 +1,4 @@
 # Physical AI RL IN  Minecraft
-![Uploading 강화학습.gif…]()
 
 
 
